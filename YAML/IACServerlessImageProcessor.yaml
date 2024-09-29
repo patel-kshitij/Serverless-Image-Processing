@@ -1,0 +1,305 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  ImageStorage:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: imageprocessorstorage
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - PUT
+              - POST
+              - DELETE
+              - GET
+            AllowedOrigins:
+              - '*'
+            MaxAge: 100
+  ResizeImage:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: resize.lambda_handler
+      Code:
+        S3Bucket: image-process-lambdafunctions
+        S3Key: resize.py.zip
+      FunctionName: resize
+      Runtime: python3.12
+      Role: arn:aws:iam::339713098852:role/LabRole
+      Timeout: 900
+      Layers:
+        - arn:aws:lambda:us-east-1:770693421928:layer:Klayers-p312-Pillow:1
+  ImageFilter:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: blur.lambda_handler
+      Code:
+        S3Bucket: image-process-lambdafunctions
+        S3Key: blur.py.zip
+      FunctionName: imageFilter
+      Runtime: python3.12
+      Role: arn:aws:iam::339713098852:role/LabRole
+      Timeout: 900
+      Layers:
+        - arn:aws:lambda:us-east-1:770693421928:layer:Klayers-p312-Pillow:1
+  CropImage:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: crop.lambda_handler
+      Code:
+        S3Bucket: image-process-lambdafunctions
+        S3Key: crop.py.zip
+      FunctionName: cropImage
+      Runtime: python3.12
+      Role: arn:aws:iam::339713098852:role/LabRole
+      Timeout: 900
+      Layers:
+        - arn:aws:lambda:us-east-1:770693421928:layer:Klayers-p312-Pillow:1
+  ImageSender:
+    Type: AWS::SNS::Topic
+    Properties: {}
+  Subscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: patelkshitij20@gmail.com
+      TopicArn: !Ref ImageSender
+  ImageProcessRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: imageProcessor
+      BinaryMediaTypes:
+        - /image/jpeg
+        - image/jpeg
+  ImageProcessResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ImageProcessRestApi
+      ParentId: !GetAtt ImageProcessRestApi.RootResourceId
+      PathPart: process
+  ImageProcessStepMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ImageProcessRestApi
+      ResourceId: !Ref ImageProcessResource
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Join
+          - ''
+          - - 'arn:aws:apigateway:'
+            - !Ref AWS::Region
+            - ':states:action/StartExecution'
+        Credentials: arn:aws:iam::339713098852:role/LabRole
+        RequestTemplates:
+          application/json: !Sub
+            - '{"input": "$util.escapeJavaScript($input.json(''$''))","stateMachineArn": "${arn}"}'
+            - arn: !Ref ImageProcessStateMachine
+      MethodResponses:
+        - ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+          StatusCode: '200'
+  BucketResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ImageProcessRestApi
+      ParentId: !GetAtt ImageProcessRestApi.RootResourceId
+      PathPart: '{bucket}'
+  KeyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ImageProcessRestApi
+      ParentId: !Ref BucketResource
+      PathPart: '{key}'
+  UploadImageMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: PUT
+      ResourceId: !Ref KeyResource
+      RestApiId: !Ref ImageProcessRestApi
+      ApiKeyRequired: false
+      RequestParameters:
+        method.request.path.bucket: true
+        method.request.path.key: true
+      Integration:
+        Credentials: arn:aws:iam::339713098852:role/LabRole
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationHttpMethod: PUT
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'PUT,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+
+        Type: AWS
+        Uri: !Sub arn:aws:apigateway:us-east-1:s3:path/{bucket}/{key}
+        RequestParameters:
+          integration.request.path.bucket: method.request.path.bucket
+          integration.request.path.key: method.request.path.key
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ImageProcessStepMethod
+      - UploadImageMethod
+    Properties:
+      RestApiId: !Ref ImageProcessRestApi
+  ProdStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: Deployment
+    Properties:
+      RestApiId: !Ref ImageProcessRestApi
+      DeploymentId: !Ref Deployment
+      StageName: prod
+          
+  ImageProcessStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: arn:aws:iam::339713098852:role/LabRole
+      StateMachineName: ImageProcessStateMachine
+      DefinitionString: !Sub
+        - |-
+          {
+            "Comment": "Image Processing Workflow",
+            "StartAt": "Choice",
+            "States": {
+              "Choice": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.action",
+                    "StringEquals": "resize",
+                    "Next": "resize"
+                  },
+                  {
+                    "Variable": "$.action",
+                    "StringEquals": "applyFilter",
+                    "Next": "applyFilter"
+                  },
+                  {
+                    "Variable": "$.action",
+                    "StringEquals": "cropImage",
+                    "Next": "crop"
+                  }
+                ],
+                "Default": "SNS Publish"
+              },
+              "SNS Publish": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                  "TopicArn": "${ImageSenderTopicArn}",
+                  "Message": "A wrong choice was created. Please look out."
+                },
+                "End": true
+              },
+              "resize": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "${resizeLambdaArn}"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "End": true
+              },
+              "applyFilter": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "${ImageFilterArn}"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "End": true
+              },
+              "crop": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "${CropImageArn}"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "End": true
+              }
+            }
+          }
+        - resizeLambdaArn: !GetAtt ResizeImage.Arn
+          ImageSenderTopicArn: !Ref ImageSender
+          ImageFilterArn: !GetAtt ImageFilter.Arn
+          CropImageArn: !GetAtt CropImage.Arn
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: MyBackupPlan
+        BackupPlanRule:
+          - RuleName: DailyBackup
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: "cron(0 5 * * ? *)"
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: MyBackupVault
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: S3Backup
+        IamRoleArn: arn:aws:iam::339713098852:role/LabRole
+        Resources:
+          - !Sub arn:aws:s3:::${ImageStorage}
